@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Audio files
+*.wav
+*.mp3
+*.ogg
+
+# Model files (large)
+vosk/
+*.zip
+*.mdl
+*.fst
+*.int
+*.dubm
+*.ie
+*.mat
+*.stats
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
