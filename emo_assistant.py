@@ -1,4 +1,5 @@
 # source ~/desktop_pet/venv/bin/activate
+# 
 
 import sounddevice as sd
 import pyaudio
