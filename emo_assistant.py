@@ -1,6 +1,5 @@
 # source ~/desktop_pet/venv/bin/activate
 
-
 import sounddevice as sd
 import pyaudio
 import queue
@@ -10,15 +9,78 @@ import subprocess
 import numpy as np
 import wave
 import io
+import tempfile
+import os
 from scipy.signal import resample
 from vosk import Model, KaldiRecognizer
 from langchain_ollama import ChatOllama
+from gtts import gTTS
 
 # ---------------- CONFIG ----------------
 WAKE_WORDS = ["emo", "he moved", "a more", "email", "imo"]  # Variations due to speech recognition
 USE_WAKE_WORD = False  # Set to False to respond to all questions, True to require wake word
 SAMPLE_RATE = 16000
-AUDIO_DEVICE = 1  # Jabra SPEAK 410 USB microphone
+# Find USB microphone device automatically
+def find_usb_microphone():
+    """Find the USB microphone device index"""
+    p = pyaudio.PyAudio()
+    try:
+        for i in range(p.get_device_count()):
+            info = p.get_device_info_by_index(i)
+            # Look for Jabra or USB device with input channels
+            if (info['maxInputChannels'] > 0 and 
+                ('jabra' in info['name'].lower() or 'usb' in info['name'].lower())):
+                return i
+        # If not found, try to find any device with input channels
+        for i in range(p.get_device_count()):
+            info = p.get_device_info_by_index(i)
+            if info['maxInputChannels'] > 0:
+                return i
+        # Fallback to default
+        return None
+    finally:
+        p.terminate()
+
+def find_default_output_device():
+    """Find a default output device for PyAudio"""
+    p = pyaudio.PyAudio()
+    try:
+        # First try to get system default
+        try:
+            default_output = p.get_default_output_device_info()
+            return default_output['index']
+        except:
+            pass
+        
+        # Try to find USB speaker (Jabra) as output device
+        for i in range(p.get_device_count()):
+            info = p.get_device_info_by_index(i)
+            if (info['maxOutputChannels'] > 0 and 
+                ('jabra' in info['name'].lower() or 'usb' in info['name'].lower())):
+                return i
+        
+        # Try to find any output device
+        for i in range(p.get_device_count()):
+            info = p.get_device_info_by_index(i)
+            if info['maxOutputChannels'] > 0:
+                return i
+        return None
+    finally:
+        p.terminate()
+
+# Initialize PyAudio to find devices
+_temp_p = pyaudio.PyAudio()
+AUDIO_DEVICE = find_usb_microphone()
+OUTPUT_DEVICE = find_default_output_device()  # For PyAudio compatibility
+if AUDIO_DEVICE is None:
+    print("⚠ Warning: Could not find USB microphone, using default input device")
+    AUDIO_DEVICE = None  # Use default
+else:
+    device_info = _temp_p.get_device_info_by_index(AUDIO_DEVICE)
+    print(f"✓ Using audio input device: {device_info['name']} (index {AUDIO_DEVICE})")
+_temp_p.terminate()
+TARGET_DEVICE = "plughw:3,0"  # USB speaker for TTS output (Jabra SPEAK 410 USB)
+SPEECH_SPEED = 1.0  # TTS speed: 0.5=slower, 1.0=normal, 1.5=faster
 COMMAND_LISTEN_TIME = 4  # seconds to listen for command after wake word
 SILENCE_THRESHOLD = 2  # seconds of silence to consider question complete
 MODEL_PATH = "/home/alok/desktop_pet/vosk/vosk-model-small-en-us-0.15"
@@ -30,82 +92,63 @@ recognizer = KaldiRecognizer(vosk_model, SAMPLE_RATE)
 
 audio_queue = queue.Queue()
 
-# Use espeak with sox resampling and chunked playback for smooth audio
-def speak_with_espeak(text):
-    """Use espeak with sox resampling and chunked PyAudio playback for smooth, natural audio"""
+# Use Google Text-to-Speech for natural voice
+def speak_with_gtts(text, speed=SPEECH_SPEED):
+    """Generate speech using gTTS and play through ffmpeg/aplay"""
     try:
-        # Generate audio with espeak using MBROLA female voice
-        # mb/mb-us1 = Natural female US English voice (MBROLA)
-        # -s 160 = moderate speed for natural feel
-        # -p 50 = neutral pitch (more natural)
-        # -g 3 = minimal word gaps for smoother flow
-        # -a 100 = normal amplitude
-        espeak_cmd = ["espeak", "-v", "mb/mb-us1", "-s", "160", "-p", "50", "-g", "3", "-a", "100", text, "--stdout"]
+        # Create gTTS object (use slow=True if speed < 0.75)
+        use_slow = speed < 0.75
+        tts = gTTS(text=text, lang='en', slow=use_slow)
         
-        # Try using sox for better quality resampling (if available)
-        TARGET_RATE = 48000
+        # Save to temporary MP3 file
+        with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp_mp3:
+            tmp_mp3_path = tmp_mp3.name
+        
         try:
-            # Use sox for high-quality resampling
-            sox_cmd = ["sox", "-t", "wav", "-", "-t", "wav", "-", "rate", str(TARGET_RATE), "gain", "-1"]
-            espeak_proc = subprocess.Popen(espeak_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            sox_proc = subprocess.Popen(sox_cmd, stdin=espeak_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            espeak_proc.stdout.close()
-            wav_data, _ = sox_proc.communicate()
-            use_sox = True
-        except (FileNotFoundError, subprocess.SubprocessError):
-            # Fallback to scipy resampling if sox not available
-            espeak_proc = subprocess.Popen(espeak_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            wav_data, _ = espeak_proc.communicate()
-            use_sox = False
-        
-        # Read WAV data
-        wav_io = io.BytesIO(wav_data)
-        with wave.open(wav_io, 'rb') as wav_file:
-            sample_rate = wav_file.getframerate()
-            audio_data = wav_file.readframes(wav_file.getnframes())
-            audio_array = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-        
-        # Resample if needed (sox already resamples to TARGET_RATE, so only resample if sox wasn't used)
-        if not use_sox and sample_rate != TARGET_RATE:
-            num_samples = int(len(audio_array) * TARGET_RATE / sample_rate)
-            resampled = resample(audio_array, num_samples)
-        else:
-            resampled = audio_array
-        
-        # Convert back to int16 for PyAudio
-        audio_int16 = (resampled * 32767).astype(np.int16)
-        
-        # Convert to stereo
-        audio_stereo = np.column_stack([audio_int16, audio_int16])
-        
-        # Play through USB speaker using PyAudio with chunked writing for smooth playback
-        p_out = pyaudio.PyAudio()
-        stream_out = p_out.open(
-            format=pyaudio.paInt16,
-            channels=2,
-            rate=TARGET_RATE,
-            output=True,
-            output_device_index=AUDIO_DEVICE,
-            frames_per_buffer=4096  # Chunk size for smooth playback
-        )
-        
-        # Write audio data in chunks to prevent buffer underruns
-        chunk_size = 4096 * 2 * 2  # frames * channels * bytes per sample
-        audio_bytes = audio_stereo.tobytes()
-        
-        for i in range(0, len(audio_bytes), chunk_size):
-            chunk = audio_bytes[i:i + chunk_size]
-            stream_out.write(chunk)
-        
-        # Wait for playback to finish
-        stream_out.stop_stream()
-        stream_out.close()
-        p_out.terminate()
+            tts.save(tmp_mp3_path)
+            
+            # Convert MP3 to WAV using ffmpeg (with optional speed adjustment)
+            # Using a temp WAV file is more reliable than piping
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_wav:
+                tmp_wav_path = tmp_wav.name
+            
+            try:
+                # Use ffmpeg to convert MP3 to WAV (with optional speed adjustment)
+                # ffmpeg has built-in MP3 support and is more reliable than mpg123 on Raspberry Pi
+                # Specify format explicitly: 16-bit PCM, 44100Hz, mono (compatible with USB speaker)
+                if abs(speed - 1.0) < 0.01:  # Normal speed - no tempo change
+                    ffmpeg_cmd = ["ffmpeg", "-loglevel", "error", "-i", tmp_mp3_path, 
+                                  "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "1", "-y", tmp_wav_path]
+                else:
+                    # Apply speed adjustment using atempo filter
+                    # atempo range is 0.5-2.0
+                    tempo_value = speed
+                    if tempo_value < 0.5:
+                        tempo_value = 0.5
+                    elif tempo_value > 2.0:
+                        tempo_value = 2.0
+                    ffmpeg_cmd = ["ffmpeg", "-loglevel", "error", "-i", tmp_mp3_path, 
+                                  "-af", f"atempo={tempo_value}", "-acodec", "pcm_s16le", 
+                                  "-ar", "44100", "-ac", "1", "-y", tmp_wav_path]
+                
+                subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                
+                # Play the WAV file with aplay
+                aplay_cmd = ["aplay", "-D", TARGET_DEVICE, "-q", tmp_wav_path]
+                subprocess.run(aplay_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            finally:
+                # Clean up temp WAV file
+                if os.path.exists(tmp_wav_path):
+                    os.unlink(tmp_wav_path)
+        finally:
+            # Clean up temp MP3 file
+            if os.path.exists(tmp_mp3_path):
+                os.unlink(tmp_mp3_path)
         
     except Exception as e:
         print(f"⚠ Audio error: {e}")
 
-print("✓ Text-to-speech ready (using espeak + scipy resampling)")
+print("✓ Text-to-speech ready (using Google TTS)")
 
 llm = ChatOllama(
     model="tinyllama",
@@ -120,7 +163,7 @@ def audio_callback(in_data, frame_count, time_info, status):
 # ---------------- SPEAK ----------------
 def speak(text):
     print(f"🔊 EMO Speaking: {text}")
-    speak_with_espeak(text)
+    speak_with_gtts(text, SPEECH_SPEED)
 
 # ---------------- MAIN LOOP ----------------
 print("=" * 60)
@@ -135,15 +178,57 @@ p = pyaudio.PyAudio()
 
 while True:
     # Start listening using PyAudio
-    stream = p.open(
-        format=pyaudio.paInt16,
-        channels=1,
-        rate=SAMPLE_RATE,
-        input=True,
-        input_device_index=AUDIO_DEVICE,
-        frames_per_buffer=8000,
-        stream_callback=audio_callback
-    )
+    # Try to get device info to check available channels
+    channels = 1  # Default to mono
+    if AUDIO_DEVICE is not None:
+        try:
+            device_info = p.get_device_info_by_index(AUDIO_DEVICE)
+            max_channels = device_info.get('maxInputChannels', 1)
+            # Use stereo if available, otherwise mono
+            channels = 2 if max_channels >= 2 else 1
+        except:
+            # Fallback: try stereo first, then mono
+            channels = 2
+    
+    # Try different configurations to open the stream
+    stream = None
+    channel_configs = [1, 2]  # Try mono first, then stereo
+    
+    for channels in channel_configs:
+        stream_kwargs = {
+            'format': pyaudio.paInt16,
+            'channels': channels,
+            'rate': SAMPLE_RATE,
+            'input': True,
+            'frames_per_buffer': 8000,
+            'stream_callback': audio_callback
+        }
+        
+        # Only add input_device_index if we have a specific device
+        if AUDIO_DEVICE is not None:
+            stream_kwargs['input_device_index'] = AUDIO_DEVICE
+        
+        # PyAudio sometimes requires an output device even when only using input
+        # Use USB speaker (device 1) as output device if available, or any output device
+        if OUTPUT_DEVICE is not None:
+            stream_kwargs['output_device_index'] = OUTPUT_DEVICE
+        else:
+            # Try to use the same device for output if it supports it
+            if AUDIO_DEVICE is not None:
+                try:
+                    device_info = p.get_device_info_by_index(AUDIO_DEVICE)
+                    if device_info.get('maxOutputChannels', 0) > 0:
+                        stream_kwargs['output_device_index'] = AUDIO_DEVICE
+                except:
+                    pass
+        
+        try:
+            stream = p.open(**stream_kwargs)
+            break  # Success, exit loop
+        except OSError as e:
+            if channels == channel_configs[-1]:  # Last attempt
+                raise  # Re-raise if all attempts failed
+            continue  # Try next channel configuration
     stream.start_stream()
     
     try:
