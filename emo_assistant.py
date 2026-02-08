@@ -1,8 +1,6 @@
 # source ~/desktop_pet/venv/bin/activate
 # 
-# NOTE: This script may require sudo permissions to reset USB devices.
-# If you get permission errors, run with: sudo -E python emo_assistant.py
-# The -E flag preserves your environment variables (including virtual env)
+# EMO Assistant - Voice assistant with USB microphone and PAM8403 speakers
 # 
 
 import sounddevice as sd
@@ -25,7 +23,8 @@ from gtts import gTTS
 # ---------------- CONFIG ----------------
 WAKE_WORDS = ["Bingo"]  # Variations due to speech recognition
 USE_WAKE_WORD = False  # Set to False to respond to all questions, True to require wake word
-SAMPLE_RATE = 16000
+MIC_SAMPLE_RATE = 48000  # USB microphone sample rate (48kHz is commonly supported)
+VOSK_SAMPLE_RATE = 16000  # Vosk model sample rate (required by the model)
 # Find USB microphone device automatically
 def find_usb_microphone():
     """Find the USB microphone device index"""
@@ -74,200 +73,31 @@ def find_default_output_device():
     finally:
         p.terminate()
 
-# Function to dynamically find USB speaker device
-def find_usb_speaker_device():
-    """Find USB speaker device by checking ALSA cards"""
-    try:
-        result = subprocess.run(['aplay', '-l'], capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            lines = result.stdout.split('\n')
-            usb_cards = []
-            for line in lines:
-                # Look for USB audio devices (Jabra, USB, etc.)
-                if 'USB' in line or 'Jabra' in line:
-                    # Extract card number from line like "card 2: USB [Jabra SPEAK 410 USB]"
-                    match = re.search(r'card (\d+):', line)
-                    if match:
-                        card_num = int(match.group(1))
-                        if card_num not in usb_cards:
-                            usb_cards.append(card_num)
-            
-            # If we found USB devices, use the first one found
-            # We don't need to test extensively - if it's in the list, use it
-            # The retry logic will handle cases where device isn't ready yet
-            if usb_cards:
-                return f"plughw:{usb_cards[0]},0"
-            
-            # Fallback: try common USB card numbers in order
-            for card in [2, 3, 1, 4, 5]:
-                device = f"plughw:{card},0"
-                try:
-                    test_result = subprocess.run(
-                        ['aplay', '-D', device, '--dump-hw-params', '/dev/null'],
-                        capture_output=True,
-                        timeout=2
-                    )
-                    stderr_text = test_result.stderr.decode() if test_result.stderr else ""
-                    if 'rate:' in stderr_text or 'ACCESS:' in stderr_text:
-                        return device
-                    # Even error 524 means device exists
-                    if 'error 524' in stderr_text.lower():
-                        return device
-                except (subprocess.TimeoutExpired, FileNotFoundError):
-                    continue
-    except Exception as e:
-        print(f"⚠ Warning: Could not auto-detect USB speaker: {e}")
-    
-    # Final fallback
-    return "plughw:2,0"  # Changed default to 2 since that's what we're seeing
+# Function to get audio output devices for PAM8403 (audio jack)
+def get_audio_output_devices():
+    """Get list of audio output devices to try (for PAM8403 on audio jack)"""
+    # Try these devices in order - same as test_speakers.py
+    return [
+        ("default", "System default"),
+        ("sysdefault", "System default (alt)"),
+        ("plughw:0,0", "Audio jack (card 0)"),
+        ("plughw:1,0", "Audio jack (card 1)"),
+        ("hw:0,0", "Hardware (card 0)"),
+        ("hw:1,0", "Hardware (card 1)"),
+    ]
 
-def find_usb_audio_device_path():
-    """Find the USB device path for audio devices (Jabra, USB audio, etc.)"""
-    try:
-        # Look for USB audio devices in /sys/bus/usb/devices/
-        usb_devices_path = "/sys/bus/usb/devices"
-        if not os.path.exists(usb_devices_path):
-            return None
-        
-        for device in os.listdir(usb_devices_path):
-            device_path = os.path.join(usb_devices_path, device)
-            
-            # Check if it's a valid USB device directory
-            if not os.path.isdir(device_path):
-                continue
-                
-            # Try to read product name
-            try:
-                product_file = os.path.join(device_path, "product")
-                if os.path.exists(product_file):
-                    with open(product_file, 'r') as f:
-                        product_name = f.read().strip().lower()
-                        # Look for audio-related USB devices
-                        if any(keyword in product_name for keyword in ['jabra', 'audio', 'speaker', 'microphone', 'headset']):
-                            return device
-                
-                # Also check manufacturer
-                manufacturer_file = os.path.join(device_path, "manufacturer")
-                if os.path.exists(manufacturer_file):
-                    with open(manufacturer_file, 'r') as f:
-                        manufacturer = f.read().strip().lower()
-                        if 'jabra' in manufacturer or 'audio' in manufacturer:
-                            return device
-            except:
-                continue
-        
-        return None
-    except Exception as e:
-        print(f"⚠ Error finding USB device: {e}")
-        return None
+# Removed USB device reset functions - not needed for PAM8403 speakers on audio jack
 
-def unbind_rebind_usb_device(device_name):
-    """Unbind and rebind a USB device to reset it"""
+def set_usb_volume(volume_percent=100):
+    """Set volume for audio device using amixer"""
     try:
-        if not device_name:
-            return False
-            
-        driver_path = f"/sys/bus/usb/devices/{device_name}/driver"
+        print(f"🔊 Setting audio volume to {volume_percent}% (FULL)...")
         
-        # Check if device has a driver
-        if not os.path.exists(driver_path):
-            print(f"⚠ No driver found for device {device_name}")
-            return False
+        # Try all common audio controls
+        controls = ['PCM', 'Master', 'Speaker', 'Headphone', 'Playback']
+        volume_set = False
         
-        # Get the driver name
-        driver_name = os.path.basename(os.path.realpath(driver_path))
-        unbind_path = f"/sys/bus/usb/drivers/{driver_name}/unbind"
-        bind_path = f"/sys/bus/usb/drivers/{driver_name}/bind"
-        
-        print(f"📤 Unbinding USB device {device_name} from driver {driver_name}...")
-        
-        # Unbind the device
-        try:
-            with open(unbind_path, 'w') as f:
-                f.write(device_name)
-            time.sleep(1)
-            print(f"✓ Device unbound")
-        except PermissionError:
-            # Try with sudo
-            result = subprocess.run(['sudo', 'sh', '-c', f'echo {device_name} > {unbind_path}'], 
-                                  capture_output=True, timeout=5)
-            if result.returncode != 0:
-                print(f"⚠ Failed to unbind device (you may need sudo permissions)")
-                return False
-            time.sleep(1)
-            print(f"✓ Device unbound (with sudo)")
-        
-        print(f"📥 Rebinding USB device {device_name}...")
-        
-        # Rebind the device
-        try:
-            with open(bind_path, 'w') as f:
-                f.write(device_name)
-            time.sleep(2)
-            print(f"✓ Device rebound")
-        except PermissionError:
-            # Try with sudo
-            result = subprocess.run(['sudo', 'sh', '-c', f'echo {device_name} > {bind_path}'], 
-                                  capture_output=True, timeout=5)
-            if result.returncode != 0:
-                print(f"⚠ Failed to rebind device")
-                return False
-            time.sleep(2)
-            print(f"✓ Device rebound (with sudo)")
-        
-        return True
-        
-    except Exception as e:
-        print(f"⚠ Error during USB reset: {e}")
-        return False
-
-def reset_usb_audio_devices():
-    """Reset USB audio devices by unbinding and rebinding them"""
-    try:
-        print("\n" + "="*60)
-        print("🔄 Resetting USB audio devices...")
-        print("="*60)
-        
-        # Find USB audio device
-        usb_device = find_usb_audio_device_path()
-        
-        if usb_device:
-            print(f"✓ Found USB audio device: {usb_device}")
-            success = unbind_rebind_usb_device(usb_device)
-            if success:
-                print("✓ USB audio device reset successfully")
-                print("="*60 + "\n")
-                return True
-        else:
-            print("⚠ Could not find USB audio device to reset")
-        
-        # Fallback: try restarting pulseaudio
-        try:
-            print("🔄 Trying to restart audio system (fallback)...")
-            subprocess.run(['pulseaudio', '--kill'], capture_output=True, timeout=2)
-            time.sleep(0.5)
-            subprocess.run(['pulseaudio', '--start'], capture_output=True, timeout=2)
-            time.sleep(1)
-            print("✓ Audio system restarted")
-            print("="*60 + "\n")
-            return True
-        except:
-            print(f"⚠ Could not reset audio devices automatically")
-            print("   Please unplug and replug the USB audio device manually.")
-            print("="*60 + "\n")
-            return False
-            
-    except Exception as e:
-        print(f"⚠ Error resetting USB audio devices: {e}")
-        print("="*60 + "\n")
-        return False
-
-def set_usb_volume(volume_percent=90):
-    """Set volume for USB audio device using amixer"""
-    try:
-        print(f"🔊 Setting USB audio volume to {volume_percent}%...")
-        
-        # Try to find USB audio card
+        # Try to find USB audio card first
         result = subprocess.run(['aplay', '-l'], capture_output=True, text=True, timeout=5)
         if result.returncode == 0:
             lines = result.stdout.split('\n')
@@ -278,168 +108,100 @@ def set_usb_volume(volume_percent=90):
                     if match:
                         card_num = match.group(1)
                         # Set volume using amixer
-                        # Try different control names that might work
-                        controls = ['PCM', 'Speaker', 'Master', 'Headphone']
                         for control in controls:
                             try:
                                 cmd = ['amixer', '-c', card_num, 'sset', control, f'{volume_percent}%']
                                 result = subprocess.run(cmd, capture_output=True, timeout=2)
                                 if result.returncode == 0:
                                     print(f"✓ Volume set to {volume_percent}% on card {card_num} ({control})")
-                                    return True
+                                    volume_set = True
+                                # Also unmute
+                                subprocess.run(['amixer', '-c', card_num, 'sset', control, 'unmute'], 
+                                             capture_output=True, timeout=2)
                             except:
                                 continue
         
-        # Fallback: try setting volume without card number
-        try:
-            subprocess.run(['amixer', 'sset', 'PCM', f'{volume_percent}%'], 
-                         capture_output=True, timeout=2)
-            print(f"✓ Volume set to {volume_percent}%")
-            return True
-        except:
-            pass
-            
-        print(f"⚠ Could not set volume automatically")
-        return False
+        # Fallback: try setting volume without card number (for all devices)
+        for control in controls:
+            try:
+                result = subprocess.run(['amixer', 'sset', control, f'{volume_percent}%'], 
+                                      capture_output=True, timeout=2)
+                if result.returncode == 0:
+                    print(f"✓ {control} volume set to {volume_percent}%")
+                    volume_set = True
+                # Also unmute
+                subprocess.run(['amixer', 'sset', control, 'unmute'], 
+                             capture_output=True, timeout=2)
+            except:
+                pass
+        
+        if not volume_set:
+            print(f"⚠ Could not set volume automatically")
+            return False
+        
+        return True
     except Exception as e:
         print(f"⚠ Could not set volume: {e}")
         return False
 
-def initialize_audio_devices_with_retry(max_attempts=3):
-    """Initialize audio devices with retry logic and device reset"""
-    # On first run, always try to reset USB devices
+def initialize_audio_devices():
+    """Initialize audio devices - USB microphone and PAM8403 speakers"""
     print("\n" + "="*60)
-    print("🚀 Starting EMO Assistant - Initializing USB Audio...")
+    print("🚀 Starting EMO Assistant")
     print("="*60)
-    reset_usb_audio_devices()
     
-    # Give the system time to recognize the device after reset
-    print("⏳ Waiting for USB device to be ready...")
-    time.sleep(5)  # Increased wait time for device to be fully recognized
+    # Detect USB microphone
+    temp_p = pyaudio.PyAudio()
+    audio_device = find_usb_microphone()
+    output_device = find_default_output_device()
     
-    for attempt in range(max_attempts):
-        try:
-            print(f"\n{'='*60}")
-            print(f"🎤 Initializing audio devices (attempt {attempt + 1}/{max_attempts})...")
-            print(f"{'='*60}")
-            
-            # If not first attempt, try to reset the audio system again
-            if attempt > 0:
-                print(f"\n⚠ Device not ready, resetting USB device again...")
-                reset_usb_audio_devices()
-                print("⏳ Waiting for device to stabilize...")
-                time.sleep(5)  # Wait longer for device to be fully ready
-                print("💡 TIP: If this keeps failing, please:")
-                print("   1. Unplug the USB audio device")
-                print("   2. Wait 2-3 seconds") 
-                print("   3. Plug it back in")
-                print("   4. The program will retry automatically\n")
-                time.sleep(2)
-            
-            # Force PyAudio to refresh its device list by creating a new instance
-            # This is crucial after USB device reset
-            print("🔄 Refreshing audio device list...")
-            temp_p = pyaudio.PyAudio()
-            temp_p.terminate()
-            time.sleep(0.5)
-            
-            # Now create a fresh PyAudio instance with updated device list
-            temp_p = pyaudio.PyAudio()
-            audio_device = find_usb_microphone()
-            output_device = find_default_output_device()
-            
-            if audio_device is None:
-                print("⚠ Warning: Could not find USB microphone, using default input device")
-            else:
-                device_info = temp_p.get_device_info_by_index(audio_device)
-                print(f"✓ Using audio input device: {device_info['name']} (index {audio_device})")
-            
-            temp_p.terminate()
-            
-            # Detect speaker
-            target_device = find_usb_speaker_device()
-            print(f"✓ Using audio output device: {target_device}")
-            
-            # Set volume
-            set_usb_volume(90)
-            
-            # Test if we can open a stream (quick test)
-            print("🧪 Testing audio stream...")
-            test_p = pyaudio.PyAudio()
-            stream_test_passed = False
-            
-            # Try opening stream without output device first (input only)
-            try:
-                test_kwargs = {
-                    'format': pyaudio.paInt16,
-                    'channels': 1,
-                    'rate': SAMPLE_RATE,
-                    'input': True,
-                    'frames_per_buffer': 8000,
-                }
-                if audio_device is not None:
-                    test_kwargs['input_device_index'] = audio_device
-                    
-                test_stream = test_p.open(**test_kwargs)
-                test_stream.close()
-                stream_test_passed = True
-                print("✓ Audio stream test passed (input only)")
-            except Exception as e1:
-                # If that fails, try with output device
-                try:
-                    test_kwargs = {
-                        'format': pyaudio.paInt16,
-                        'channels': 1,
-                        'rate': SAMPLE_RATE,
-                        'input': True,
-                        'frames_per_buffer': 8000,
-                    }
-                    if audio_device is not None:
-                        test_kwargs['input_device_index'] = audio_device
-                    if output_device is not None:
-                        test_kwargs['output_device_index'] = output_device
-                        
-                    test_stream = test_p.open(**test_kwargs)
-                    test_stream.close()
-                    stream_test_passed = True
-                    print("✓ Audio stream test passed (with output device)")
-                except Exception as e2:
-                    test_p.terminate()
-                    if attempt < max_attempts - 1:
-                        print(f"✗ Audio stream test failed:")
-                        print(f"   First attempt: {e1}")
-                        print(f"   Second attempt: {e2}")
-                        continue
-                    else:
-                        # On final attempt, provide detailed error
-                        print(f"✗ Audio stream test failed after all attempts")
-                        print(f"   Error: {e2}")
-                        raise
-            
-            test_p.terminate()
-            
-            if stream_test_passed:
-                print(f"{'='*60}\n")
-                return audio_device, output_device, target_device
-                    
-        except Exception as e:
-            if attempt == max_attempts - 1:
-                print(f"\n{'='*60}")
-                print("❌ FAILED TO INITIALIZE AUDIO DEVICES")
-                print(f"{'='*60}")
-                print(f"Error: {e}")
-                print("\n💡 SOLUTION:")
-                print("   1. Unplug the USB audio device")
-                print("   2. Wait 2-3 seconds")
-                print("   3. Plug it back in")
-                print("   4. Restart the program")
-                print(f"{'='*60}\n")
-                raise
+    if audio_device is None:
+        print("⚠ Warning: Could not find USB microphone, using default input device")
+    else:
+        device_info = temp_p.get_device_info_by_index(audio_device)
+        print(f"✓ USB microphone: {device_info['name']} (index {audio_device})")
     
-    raise Exception("Failed to initialize audio devices after all attempts")
+    temp_p.terminate()
+    
+    # Set volume to maximum for PAM8403 speakers
+    print("✓ Audio output: PAM8403 speakers on audio jack")
+    set_usb_volume(100)
+    
+    # Test microphone stream with correct sample rate
+    print(f"🧪 Testing microphone at {MIC_SAMPLE_RATE}Hz...")
+    test_p = pyaudio.PyAudio()
+    try:
+        test_kwargs = {
+            'format': pyaudio.paInt16,
+            'channels': 1,
+            'rate': MIC_SAMPLE_RATE,
+            'input': True,
+            'frames_per_buffer': 8000,
+        }
+        if audio_device is not None:
+            test_kwargs['input_device_index'] = audio_device
+            
+        test_stream = test_p.open(**test_kwargs)
+        test_stream.close()
+        test_p.terminate()
+        print("✓ Microphone test passed")
+        print(f"{'='*60}\n")
+        return audio_device, output_device
+    except Exception as e:
+        test_p.terminate()
+        print(f"\n{'='*60}")
+        print("❌ FAILED TO INITIALIZE MICROPHONE")
+        print(f"{'='*60}")
+        print(f"Error: {e}")
+        print("\n💡 SOLUTION:")
+        print("   1. Check USB microphone connection")
+        print("   2. Try unplugging and replugging the USB microphone")
+        print("   3. Restart the program")
+        print(f"{'='*60}\n")
+        raise
 
-# Initialize PyAudio to find devices with retry logic
-AUDIO_DEVICE, OUTPUT_DEVICE, TARGET_DEVICE = initialize_audio_devices_with_retry(max_attempts=3)
+# Initialize PyAudio to find devices
+AUDIO_DEVICE, OUTPUT_DEVICE = initialize_audio_devices()
 SPEECH_SPEED = 1.0  # TTS speed: 0.5=slower, 1.0=normal, 1.5=faster
 COMMAND_LISTEN_TIME = 4  # seconds to listen for command after wake word
 SILENCE_THRESHOLD = 2  # seconds of silence to consider question complete
@@ -448,9 +210,29 @@ MODEL_PATH = "/home/alok/desktop_pet/vosk/vosk-model-small-en-us-0.15"
 # ---------------- INIT ----------------
 print("Loading Vosk model...")
 vosk_model = Model(MODEL_PATH)
-recognizer = KaldiRecognizer(vosk_model, SAMPLE_RATE)
+recognizer = KaldiRecognizer(vosk_model, VOSK_SAMPLE_RATE)
 
 audio_queue = queue.Queue()
+
+# ---------------- AUDIO CALLBACK (PyAudio) ----------------
+def audio_callback(in_data, frame_count, time_info, status):
+    """Callback that receives audio from microphone and resamples for Vosk"""
+    # Convert bytes to numpy array
+    audio_np = np.frombuffer(in_data, dtype=np.int16)
+    
+    # Resample from MIC_SAMPLE_RATE to VOSK_SAMPLE_RATE
+    if MIC_SAMPLE_RATE != VOSK_SAMPLE_RATE:
+        # Calculate number of samples after resampling
+        num_samples = int(len(audio_np) * VOSK_SAMPLE_RATE / MIC_SAMPLE_RATE)
+        # Resample
+        audio_resampled = resample(audio_np, num_samples).astype(np.int16)
+        # Convert back to bytes
+        resampled_data = audio_resampled.tobytes()
+        audio_queue.put(resampled_data)
+    else:
+        audio_queue.put(in_data)
+    
+    return (in_data, pyaudio.paContinue)
 
 # Use Google Text-to-Speech for natural voice
 def speak_with_gtts(text, speed=SPEECH_SPEED):
@@ -474,11 +256,10 @@ def speak_with_gtts(text, speed=SPEECH_SPEED):
             
             try:
                 # Use ffmpeg to convert MP3 to WAV (with optional speed adjustment)
-                # ffmpeg has built-in MP3 support and is more reliable than mpg123 on Raspberry Pi
-                # Specify format explicitly: 16-bit PCM, 44100Hz, mono (compatible with USB speaker)
+                # Specify format: 16-bit PCM, 48000Hz, stereo (compatible with PAM8403)
                 if abs(speed - 1.0) < 0.01:  # Normal speed - no tempo change
                     ffmpeg_cmd = ["ffmpeg", "-loglevel", "error", "-i", tmp_mp3_path, 
-                                  "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "1", "-y", tmp_wav_path]
+                                  "-acodec", "pcm_s16le", "-ar", "48000", "-ac", "2", "-y", tmp_wav_path]
                 else:
                     # Apply speed adjustment using atempo filter
                     # atempo range is 0.5-2.0
@@ -489,9 +270,9 @@ def speak_with_gtts(text, speed=SPEECH_SPEED):
                         tempo_value = 2.0
                     ffmpeg_cmd = ["ffmpeg", "-loglevel", "error", "-i", tmp_mp3_path, 
                                   "-af", f"atempo={tempo_value}", "-acodec", "pcm_s16le", 
-                                  "-ar", "44100", "-ac", "1", "-y", tmp_wav_path]
+                                  "-ar", "48000", "-ac", "2", "-y", tmp_wav_path]
                 
-                ffmpeg_result = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                ffmpeg_result = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
                 
                 if ffmpeg_result.returncode != 0:
                     print(f"⚠ ffmpeg failed with code {ffmpeg_result.returncode}")
@@ -499,65 +280,34 @@ def speak_with_gtts(text, speed=SPEECH_SPEED):
                         print(f"   Error: {ffmpeg_result.stderr.decode()}")
                     return False
                 
-                # Play the WAV file with aplay (with retry if device not ready)
-                max_retries = 3
-                retry_delay = 1.0  # Increased delay to give device time to be ready
-                current_device = TARGET_DEVICE
+                # Play the WAV file with aplay - try multiple devices (PAM8403 on audio jack)
+                devices_to_try = get_audio_output_devices()
                 aplay_success = False
                 
                 # Small delay before first attempt to ensure device is ready
                 time.sleep(0.2)
                 
-                for attempt in range(max_retries):
+                for device, description in devices_to_try:
                     try:
-                        aplay_cmd = ["aplay", "-D", current_device, "-q", tmp_wav_path]
+                        aplay_cmd = ["aplay", "-D", device, "-q", tmp_wav_path]
                         aplay_result = subprocess.run(
                             aplay_cmd, 
                             stdout=subprocess.PIPE, 
                             stderr=subprocess.PIPE,
-                            timeout=30
+                            timeout=15
                         )
                         
                         if aplay_result.returncode == 0:
                             aplay_success = True
-                            break  # Success
-                        
-                        # Check if it's a device error (524 or similar)
-                        error_msg = aplay_result.stderr.decode() if aplay_result.stderr else ""
-                        if ("error 524" in error_msg.lower() or 
-                            "audio open error" in error_msg.lower() or
-                            "unknown error" in error_msg.lower()):
-                            if attempt < max_retries - 1:
-                                # Device might not be ready or card number changed, try re-detecting
-                                print(f"⚠ Audio device error (attempt {attempt + 1}/{max_retries})")
-                                print(f"   Current device: {current_device}")
-                                
-                                # Re-detect device (card number might have changed or device might be ready now)
-                                new_device = find_usb_speaker_device()
-                                if new_device != current_device:
-                                    print(f"   Device changed from {current_device} to {new_device}")
-                                    current_device = new_device
-                                else:
-                                    print(f"   Retrying with same device: {current_device}")
-                                time.sleep(retry_delay)
-                                continue
-                        
-                        # If it's not a device error, show the error and fail
-                        print(f"⚠ aplay failed with code {aplay_result.returncode}")
-                        if error_msg:
-                            print(f"   Error: {error_msg}")
-                        return False
+                            break  # Success - stop trying other devices
                         
                     except subprocess.TimeoutExpired:
-                        if attempt < max_retries - 1:
-                            print(f"⚠ Playback timeout (attempt {attempt + 1}/{max_retries}), retrying...")
-                            time.sleep(retry_delay)
-                            continue
-                        print("⚠ aplay timed out after multiple retries")
-                        return False
+                        continue
+                    except Exception:
+                        continue
                 
                 if not aplay_success:
-                    print("⚠ aplay failed after all retries")
+                    print("⚠ Audio playback failed on all devices")
                     return False
                     
                 return True
@@ -582,12 +332,6 @@ llm = ChatOllama(
     model="tinyllama",
     temperature=0
 )
-
-# ---------------- AUDIO CALLBACK (PyAudio) ----------------
-def audio_callback(in_data, frame_count, time_info, status):
-    audio_queue.put(in_data)
-    return (in_data, pyaudio.paContinue)
-
 # ---------------- SPEAK ----------------
 def speak(text):
     print(f"🔊 EMO Speaking: {text}")
@@ -627,7 +371,7 @@ while True:
         stream_kwargs = {
             'format': pyaudio.paInt16,
             'channels': channels,
-            'rate': SAMPLE_RATE,
+            'rate': MIC_SAMPLE_RATE,
             'input': True,
             'frames_per_buffer': 8000,
             'stream_callback': audio_callback
@@ -680,7 +424,7 @@ while True:
             audio_queue.get()
         
         # Reset recognizer
-        recognizer = KaldiRecognizer(vosk_model, SAMPLE_RATE)
+        recognizer = KaldiRecognizer(vosk_model, VOSK_SAMPLE_RATE)
         
         question_detected = False
         command_text = ""
@@ -714,7 +458,7 @@ while True:
                         
                         # Listen for additional command
                         print(f"🎤 Listening for command ({COMMAND_LISTEN_TIME}s)...")
-                        command_recognizer = KaldiRecognizer(vosk_model, SAMPLE_RATE)
+                        command_recognizer = KaldiRecognizer(vosk_model, VOSK_SAMPLE_RATE)
                         start_time = time.time()
                         command_parts = []
                         
